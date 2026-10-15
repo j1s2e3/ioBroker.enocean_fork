@@ -21,6 +21,7 @@ const HandleType10 = require('./lib/tools/Packet_handler').handleType10;
 const HandleTeachIn = require('./lib/tools/Packet_handler').handleTeachIn;
 const ReceiveQueue = require('./lib/tools/ReceiveQueue');
 const allDone = require('./lib/tools/allDone');
+const { performance } = require('perf_hooks');
 
 const jsonLogic = require('json-logic-js');
 
@@ -41,7 +42,7 @@ let tcpClient = null;
 let tcpReconnectCounter = 0;
 
 let teachinMethod = null;
-let timeoutQueue, timeoutWait, timeoutTeachin, timeoutGateway;
+let timeoutWait, timeoutTeachin, timeoutGateway;
 
 // Received telegrams are processed one after another; one that takes longer than this is left behind
 const RX_TIMEOUT_MS = 10 * 1000;
@@ -56,6 +57,8 @@ const SERIAL_CHECK_MS = 10 * 1000;
 // Telegrams waiting longer than this in the send queue are dropped. The scripts confirm and repeat their
 // commands themselves; older ones would only be outdated duplicates after a reconnect.
 const SEND_MAX_AGE_MS = 10 * 1000;
+// Minimum gap between two telegrams sent to the gateway (the repeated copies of the previous one are still on air)
+const SEND_INTERVAL_MS = 50;
 
 
 class Enocean extends utils.Adapter {
@@ -102,6 +105,12 @@ class Enocean extends utils.Adapter {
 		this.serialStableMs = SERIAL_STABLE_MS;
 		this.serialCheckMs = SERIAL_CHECK_MS;
 		this.sendMaxAgeMs = SEND_MAX_AGE_MS;
+		this.sendIntervalMs = SEND_INTERVAL_MS;
+		// send loop: its timer, a run is under way, when the last telegram went to the gateway (performance.now(),
+		// like the queue entries: a clock step after boot must not drop or rush telegrams; see kickSendQueue)
+		this.sendTimer = null;
+		this.sendBusy = false;
+		this.lastSendTs = -Infinity;
 		this.serialAttempt = 0;
 		this.serialReconnectTimer = null;
 		this.serialWatchdog = null;
@@ -197,7 +206,7 @@ class Enocean extends utils.Adapter {
 		clearTimeout(this.serialReconnectTimer);
 		clearInterval(this.serialWatchdog);
 		clearTimeout(timeoutWait);
-		clearTimeout(timeoutQueue);
+		clearTimeout(this.sendTimer);
 		clearTimeout(timeoutTeachin);
 		clearTimeout(timeoutGateway);
 		try {
@@ -282,6 +291,9 @@ class Enocean extends utils.Adapter {
 					case 'CMD': {
 						let data = ByteArray.from();
 						let send = true;
+						// parameter states of the command; acknowledged once the telegram is queued, so these writes
+						// (four database round trips each) no longer delay the telegram
+						const acknowledge = [];
 
 
 						for (const c in eepProfile.case) {
@@ -323,7 +335,7 @@ class Enocean extends utils.Adapter {
 							//get data from objects
 							for (const s in parameter) {
 								const state = await this.getStateAsync(`${this.namespace}.${devId}.${parameter[s]}`);
-								await this.setState(`${this.namespace}.${devId}.${parameter[s]}`, {ack: true});
+								acknowledge.push(`${this.namespace}.${devId}.${parameter[s]}`);
 								const short = parameter[s];
 								const datafield = eepProfile.case[c].datafield;
 								for (const d in datafield) {
@@ -350,6 +362,7 @@ class Enocean extends utils.Adapter {
 							}
 						}
 						if(send === false || !data){
+							await this.acknowledgeStates(acknowledge);
 							break;
 						}
 
@@ -363,11 +376,13 @@ class Enocean extends utils.Adapter {
 							// receiverID.push('0x' + tempId[b]);
 							receiverID.push(parseInt(tempId[b], 16));
 						}
-						const gateway = await this.getObjectAsync('gateway');
-						let baseID = gateway.native.BaseID;
-
+						let baseID;
 						if (obj.native.baseIDoffset) {
 							baseID = obj.native.Sender_ID;
+						} else {
+							// only devices without own sender ID need the base ID of the gateway
+							const gateway = await this.getObjectAsync('gateway');
+							baseID = gateway.native.BaseID;
 						}
 						baseID = ByteArray.from(baseID.match(/.{1,2}/g));
 
@@ -404,12 +419,17 @@ class Enocean extends utils.Adapter {
 
 						if (finalData === undefined) {
 							this.log.warn(`${id}: sending ${rorg} telegrams is not supported`);
+							await this.acknowledgeStates(acknowledge);
 							break;
 						}
 
-						this.queue.push({'data': finalData, 'optionaldata': optionalData, 'packettype': 0x01, 'ts': Date.now()});
+						this.queue.push({'data': finalData, 'optionaldata': optionalData, 'packettype': 0x01, 'ts': performance.now()});
+						this.kickSendQueue();
 
-						await this.setStateAsync(id, {ack: true});
+						// as before: parameters and command count as done once the telegram is queued. The command after
+						// its parameters, also if acknowledging one of them fails; the first error is passed on.
+						const parameters = this.acknowledgeStates(acknowledge);
+						await allDone([parameters, parameters.catch(() => {}).then(() => this.setStateAsync(id, {ack: true}))]);
 						break;
 					}
 				}
@@ -1390,7 +1410,7 @@ class Enocean extends utils.Adapter {
 	 * Drop queued telegrams that waited longer than sendMaxAgeMs (gateway gone), oldest first
 	 */
 	dropStaleTelegrams() {
-		const now = Date.now();
+		const now = performance.now();
 		let dropped = 0;
 		while (this.queue.length > 0 && this.queue[0].ts !== undefined && now - this.queue[0].ts > this.sendMaxAgeMs) {
 			this.queue.splice(0, 1);
@@ -1401,27 +1421,66 @@ class Enocean extends utils.Adapter {
 		}
 	}
 
+	/**
+	 * A telegram was queued: send it at once if the gateway has been idle for sendIntervalMs. Otherwise the send
+	 * loop takes it at its next turn, as before (it checks the queue every sendIntervalMs).
+	 */
+	kickSendQueue() {
+		if (!this.sendLoopStarted || this.sendBusy || this.unloading) {
+			return;
+		}
+		if (performance.now() - this.lastSendTs < this.sendIntervalMs) {
+			return;
+		}
+		clearTimeout(this.sendTimer);
+		this.sendTimer = null;
+		this.sendQueue();
+	}
+
 	async sendQueue(){
+		if (this.unloading || this.sendBusy) {
+			return;
+		}
+		this.sendBusy = true;
+		try {
+			this.dropStaleTelegrams();
+			// while the serial port is closed, telegrams stay queued; before, they were written to the closed port
+			if(this.queue.length > 0 && this.gatewayWritable()){
+				const data = this.queue[0].data;
+				const optionalData = this.queue[0].optionaldata;
+				const packetType = this.queue[0].packettype;
+				// a broken entry must not stop the send loop (before, the next timer was never set)
+				try {
+					await this.sendData(this, data, optionalData, packetType);
+				} catch (e) {
+					this.logError('Sending a telegram failed, it is dropped', e);
+				}
+				this.queue.splice(0,1);
+				this.lastSendTs = performance.now();
+			}
+		} catch (e) {
+			// whatever happens, the loop must go on
+			this.logError('Send loop', e);
+		} finally {
+			this.sendBusy = false;
+		}
 		if (this.unloading) {
 			return;
 		}
-		this.dropStaleTelegrams();
-		// while the serial port is closed, telegrams stay queued; before, they were written to the closed port
-		if(this.queue.length > 0 && this.gatewayWritable()){
-			const data = this.queue[0].data;
-			const optionalData = this.queue[0].optionaldata;
-			const packetType = this.queue[0].packettype;
-			// a broken entry must not stop the send loop (before, the next timer was never set)
-			try {
-				await this.sendData(this, data, optionalData, packetType);
-			} catch (e) {
-				this.logError('Sending a telegram failed, it is dropped', e);
-			}
-			this.queue.splice(0,1);
-		}
-		timeoutQueue = setTimeout( () => {
+		clearTimeout(this.sendTimer);
+		this.sendTimer = setTimeout( () => {
 			this.sendQueue();
-		}, 50);
+		}, this.sendIntervalMs);
+	}
+
+	/**
+	 * Mark the parameter states of a command as acknowledged (ack=true, value unchanged). All at the same time, right
+	 * after the telegram was queued: each database connection answers in order, so they are written before a
+	 * confirmation of the device can be. If one fails, the others are still written and the first error is passed on.
+	 * @param {string[]} ids
+	 */
+	async acknowledgeStates(ids) {
+		await allDone(ids.map((stateId) => this.setState(stateId, {ack: true})));
 	}
 
 	/**
