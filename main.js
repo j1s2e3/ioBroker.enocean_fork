@@ -20,6 +20,7 @@ const HandleType4 = require('./lib/tools/Packet_handler').handleType4;
 const HandleType10 = require('./lib/tools/Packet_handler').handleType10;
 const HandleTeachIn = require('./lib/tools/Packet_handler').handleTeachIn;
 const ReceiveQueue = require('./lib/tools/ReceiveQueue');
+const allDone = require('./lib/tools/allDone');
 
 const jsonLogic = require('json-logic-js');
 
@@ -901,8 +902,8 @@ class Enocean extends utils.Adapter {
 				if (teachin) {
 					if (teachin.val === false) {
 						const telegram = new HandleType1(this, esp3packet);
-						await telegram.done;
-						await this.setStateAsync('gateway.lastID', {val: telegram.senderID, ack: true});
+						// lastID only informs: written alongside the device states, as before the receive queue
+						await allDone([telegram.done, this.setStateAsync('gateway.lastID', {val: telegram.senderID, ack: true})]);
 					} else if (teachin.val === true && teachinMethod !== null) {
 						const telegram = new RadioTelegram(esp3packet);
 						await this.setStateAsync('gateway.lastID', {val: telegram.senderID, ack: true});
@@ -937,8 +938,8 @@ class Enocean extends utils.Adapter {
 				if (teachin) {
 					if (teachin.val === false) {
 						const telegram = new HandleType1(this, esp3packet);
-						await telegram.done;
-						await this.setStateAsync('gateway.lastID', {val: telegram.senderID, ack: true});
+						// lastID only informs: written alongside the device states, as before the receive queue
+						await allDone([telegram.done, this.setStateAsync('gateway.lastID', {val: telegram.senderID, ack: true})]);
 					} else if (teachin.val === true && teachinMethod !== null) {
 						const telegram = new RadioTelegram(esp3packet);
 						await this.setStateAsync('gateway.lastID', {val: telegram.senderID, ack: true});
@@ -977,8 +978,8 @@ class Enocean extends utils.Adapter {
 				if (teachin) {
 					if (teachin.val === false){
 						const telegram = new HandleType10(this, esp3packet);
-						await telegram.done;
-						await this.setStateAsync('gateway.lastID', {val: telegram.senderID, ack: true});
+						// lastID only informs: written alongside the device states, as before the receive queue
+						await allDone([telegram.done, this.setStateAsync('gateway.lastID', {val: telegram.senderID, ack: true})]);
 					} else {
 						if (teachinMethod !== null) {
 							const telegram = new HandleTeachIn(this, esp3packet, teachinMethod);

@@ -54,22 +54,33 @@ function merge(target, source) {
 	return target;
 }
 
-/** FIFO like one database connection: each call waits for the previous one, then for its own delay */
-function fifo() {
+/**
+ * FIFO like one database connection. By default each call waits for the previous one, then for its own delay
+ * (the database is the bottleneck). With env.latencyMs > 0 calls are pipelined like requests on one socket: each
+ * answer comes latencyMs (or a longer hang) after its request, but never before the answer to the request before.
+ * @param {{latencyMs: number}} [env]
+ */
+function fifo(env) {
 	let tail = Promise.resolve();
 	return (fn, delay) => {
-		const p = tail.then(
-			() =>
-				new Promise((resolve, reject) =>
-					setTimeout(() => {
-						try {
-							resolve(fn());
-						} catch (e) {
-							reject(e);
-						}
-					}, delay),
-				),
-		);
+		let p;
+		if (env && env.latencyMs > 0) {
+			const answered = sleep(Math.max(env.latencyMs, delay));
+			p = Promise.all([tail, answered]).then(() => fn());
+		} else {
+			p = tail.then(
+				() =>
+					new Promise((resolve, reject) =>
+						setTimeout(() => {
+							try {
+								resolve(fn());
+							} catch (e) {
+								reject(e);
+							}
+						}, delay),
+					),
+			);
+		}
 		tail = p.catch(() => {});
 		return p;
 	};
@@ -147,13 +158,25 @@ class FakeAdapter extends EventEmitter {
 	_objects(op, id, fn) {
 		const full = this.env.ns(id);
 		this.env.calls.push({ op, id: full });
-		return this.env.objQ(() => fn(full), this.env.delayFor(op, full));
+		const failure = this.env.failureFor(op, full);
+		return this.env.objQ(() => {
+			if (failure) {
+				throw failure;
+			}
+			return fn(full);
+		}, this.env.delayFor(op, full));
 	}
 
 	_states(op, id, fn) {
 		const full = this.env.ns(id);
 		this.env.calls.push({ op, id: full });
-		return this.env.stQ(() => fn(full), this.env.delayFor(op, full));
+		const failure = this.env.failureFor(op, full);
+		return this.env.stQ(() => {
+			if (failure) {
+				throw failure;
+			}
+			return fn(full);
+		}, this.env.delayFor(op, full));
 	}
 
 	getForeignObjectAsync(id) {
@@ -234,20 +257,40 @@ class FakeAdapter extends EventEmitter {
 		if (st.ack === undefined) {
 			st.ack = false;
 		}
-		const p = this._states('setState', id, (full) => {
-			const old = this.env.states[full];
-			if (st.val === undefined) {
-				st.val = old ? old.val : null;
+		const write = () =>
+			this._states('setState', id, (full) => {
+				const old = this.env.states[full];
+				if (st.val === undefined) {
+					st.val = old ? old.val : null;
+				}
+				st.ts = Date.now();
+				this.env.states[full] = st;
+				this.env.writes.push({ id: full, val: st.val, ack: st.ack, t: Date.now() - this.env.t0 });
+				if (this.env.subscriptions.some((re) => re.test(full))) {
+					const copy = clone(st);
+					setImmediate(() => this.emit('stateChange', full, copy));
+				}
+				return full;
+			});
+		// like js-controller 7.2.5: _setState reads the object, performStrictObjectCheck reads it again, the states
+		// client reads the old state (for lc) before it writes; one round trip each
+		const reads = [];
+		for (let i = 0; i < this.env.objectReadsPerSetState; i++) {
+			reads.push(() => this._objects('getObject', id, (full) => clone(this.env.objects[full]) || null));
+		}
+		for (let i = 0; i < this.env.stateReadsPerSetState; i++) {
+			reads.push(() => this._states('getState', id, (full) => clone(this.env.states[full]) || null));
+		}
+		let p;
+		if (reads.length > 0) {
+			p = reads[0]();
+			for (const read of reads.slice(1)) {
+				p = p.then(read);
 			}
-			st.ts = Date.now();
-			this.env.states[full] = st;
-			this.env.writes.push({ id: full, val: st.val, ack: st.ack, t: Date.now() - this.env.t0 });
-			if (this.env.subscriptions.some((re) => re.test(full))) {
-				const copy = clone(st);
-				setImmediate(() => this.emit('stateChange', full, copy));
-			}
-			return full;
-		});
+			p = p.then(write);
+		} else {
+			p = write();
+		}
 		if (callback) {
 			p.then(() => callback(null), callback);
 			return undefined;
@@ -447,8 +490,14 @@ class TestEnv {
 		this.logs = { debug: [], info: [], warn: [], error: [] };
 		this.subscriptions = [];
 		this.hangs = [];
-		this.objQ = fifo();
-		this.stQ = fifo();
+		this.failures = [];
+		/** > 0: database calls are pipelined, each answered after this many ms (see fifo) */
+		this.latencyMs = 0;
+		/** 2 and 1: setState reads the object twice and the old state once before writing, like js-controller 7.2.5 */
+		this.objectReadsPerSetState = 0;
+		this.stateReadsPerSetState = 0;
+		this.objQ = fifo(this);
+		this.stQ = fifo(this);
 		this.terminated = [];
 		this.unhandled = [];
 		// gateway
@@ -499,6 +548,27 @@ class TestEnv {
 	 */
 	hangOnce(op, re, ms) {
 		this.hangs.push({ op, re, ms });
+	}
+
+	/**
+	 * The next database call of this kind for a matching id fails with this message
+	 * @param {string} op e.g. 'getObject', 'setState'
+	 * @param {RegExp} re full id
+	 * @param {string} message
+	 */
+	failOnce(op, re, message) {
+		this.failures.push({ op, re, message });
+	}
+
+	/** error for a call registered with failOnce(), else null */
+	failureFor(op, fullId) {
+		const i = this.failures.findIndex((f) => f.op === op && f.re.test(fullId));
+		if (i < 0) {
+			return null;
+		}
+		const error = new Error(this.failures[i].message);
+		this.failures.splice(i, 1);
+		return error;
 	}
 
 	addObject(id, obj) {
