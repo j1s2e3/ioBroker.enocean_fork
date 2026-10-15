@@ -191,6 +191,14 @@ To test telegram handling create a channel with name development and in this cha
 
 ## Changelog
 
+### 0.10.0 (2026-10-15)
+* (j1s2e3) fork release (branch mychanges2), based on 0.9.3 with the EEP and device fixes of the fork (Eltako FB55B/FB65B, FD62/FL62, TF-13-20 set point rounding, TF-13-21 byte order)
+* (j1s2e3) process received telegrams strictly one after another
+* (j1s2e3) errors in event handlers no longer stop the adapter
+* (j1s2e3) reopen the serial port after it was closed or could not be opened; watchdog for a USB disconnect that serialport does not report
+* (j1s2e3) ignore echoes of own telegrams; round and limit values sent to devices
+* (j1s2e3) read the repeater setting back from the gateway; log negative gateway answers as warnings
+
 ### 0.9.1 (2023-09-01)
 * (Jey Cee) added support for Eltako FKD-am
 * (Jey Cee) added Afriso ASD 20

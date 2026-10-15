@@ -1,8 +1,12 @@
 {
   "common": {
     "name": "enocean",
-    "version": "0.9.3",
+    "version": "0.10.0",
     "news": {
+      "0.10.0": {
+        "en": "Fork j1s2e3/mychanges2, based on 0.9.3 with the EEP and device fixes of the fork\nreceived telegrams are processed strictly one after another\nerrors in event handlers no longer stop the adapter\nthe serial port is reopened after it was lost, also after a USB disconnect that serialport does not report\nechoes of own telegrams are ignored, values sent to devices are rounded and limited\nthe repeater setting is read back from the gateway, negative gateway answers are logged as warnings",
+        "de": "Fork j1s2e3/mychanges2, basiert auf 0.9.3 mit den EEP- und Gerätekorrekturen des Forks\nempfangene Telegramme werden strikt nacheinander verarbeitet\nFehler in Ereignis-Handlern beenden den Adapter nicht mehr\ndie serielle Schnittstelle wird nach einem Ausfall neu geöffnet, auch wenn serialport das Abziehen des USB-Sticks nicht meldet\nEchos eigener Telegramme werden ignoriert, Werte an Geräte werden gerundet und begrenzt\ndie Repeater-Einstellung wird vom Gateway zurückgelesen, Fehlerantworten des Gateways erscheinen als Warnung"
+      },
       "0.9.1": {
         "en": "added support for Eltako FKD-am\n added Afriso ASD 20\n added EEP F6-05-02\n change log level for missing /dev/serial/by-id\n change log level for initial information request on gateway\n update X1-01-02.json"
       },
