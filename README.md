@@ -191,6 +191,9 @@ To test telegram handling create a channel with name development and in this cha
 
 ## Changelog
 
+### 0.10.2 (2026-10-15)
+* (j1s2e3) commands: acknowledge the parameter states after the telegram is queued, read the gateway object only for devices without own sender ID, send at once when the gateway has been idle for 50 ms
+
 ### 0.10.1 (2026-10-15)
 * (j1s2e3) received telegrams: write lastID, rssi and repeated alongside the device states (with the receive queue of 0.10.0 they delayed every telegram); create the object repeated once per device
 

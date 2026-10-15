@@ -1,8 +1,12 @@
 {
   "common": {
     "name": "enocean",
-    "version": "0.10.1",
+    "version": "0.10.2",
     "news": {
+      "0.10.2": {
+        "en": "Fork j1s2e3/mychanges2: commands are sent sooner; parameters are acknowledged after the telegram is queued, a telegram goes out at once when the gateway is idle",
+        "de": "Fork j1s2e3/mychanges2: Befehle werden schneller gesendet; Parameter werden nach dem Einreihen des Telegramms quittiert, ein Telegramm geht sofort raus, wenn das Gateway frei ist"
+      },
       "0.10.1": {
         "en": "Fork j1s2e3/mychanges2: received telegrams are processed faster again; lastID, rssi and repeated are written alongside the device states instead of before and after them",
         "de": "Fork j1s2e3/mychanges2: empfangene Telegramme werden wieder schneller verarbeitet; lastID, rssi und repeated werden parallel zu den Gerätezuständen geschrieben statt davor bzw. danach"
