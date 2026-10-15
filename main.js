@@ -61,8 +61,14 @@ class Enocean extends utils.Adapter {
 		this.queue = [];
 		this.on('ready', this.onReady.bind(this));
 		//this.on('objectChange', this.onObjectChange.bind(this));
-		this.on('stateChange', this.onStateChange.bind(this));
-		this.on('message', this.onMessage.bind(this));
+		// The event emitter does not await these async handlers: an error would be an unhandled promise
+		// rejection, and js-controller stops the adapter on that. Log it instead.
+		this.on('stateChange', (id, state) => {
+			this.onStateChange(id, state).catch((e) => this.logError(`stateChange ${id}`, e));
+		});
+		this.on('message', (obj) => {
+			this.onMessage(obj).catch((e) => this.logError(`message ${obj && obj.command}`, e));
+		});
 		this.on('unload', this.onUnload.bind(this));
 
 		this.predifnedDeviceTeachIn = require('./lib/tools/Packet_handler').predifnedDeviceTeachin;
@@ -128,6 +134,15 @@ class Enocean extends utils.Adapter {
 		if (this.config.ser2net === true || this.config.gateway === 'all-smart'){
 			this.connectTCP();
 		}
+	}
+
+	/**
+	 * Log an error with stack where a failure must not end the adapter process
+	 * @param {string} where
+	 * @param {any} e
+	 */
+	logError(where, e) {
+		this.log.error(`${where}: ${(e && e.stack) || e}`);
 	}
 
 	/**
@@ -343,6 +358,11 @@ class Enocean extends utils.Adapter {
 								}
 								finalData = type.concat(data, baseID, [0x00]);
 								break;
+						}
+
+						if (finalData === undefined) {
+							this.log.warn(`${id}: sending ${rorg} telegrams is not supported`);
+							break;
 						}
 
 						this.queue.push({'data': finalData, 'optionaldata': optionalData, 'packettype': 0x01});
@@ -1048,7 +1068,12 @@ class Enocean extends utils.Adapter {
 			const data = this.queue[0].data;
 			const optionalData = this.queue[0].optionaldata;
 			const packetType = this.queue[0].packettype;
-			await this.sendData(this, data, optionalData, packetType);
+			// a broken entry must not stop the send loop (before, the next timer was never set)
+			try {
+				await this.sendData(this, data, optionalData, packetType);
+			} catch (e) {
+				this.logError('Sending a telegram failed, it is dropped', e);
+			}
 			this.queue.splice(0,1);
 		}
 		timeoutQueue = setTimeout( () => {
