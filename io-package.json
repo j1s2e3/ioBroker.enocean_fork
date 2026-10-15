@@ -1,8 +1,12 @@
 {
   "common": {
     "name": "enocean",
-    "version": "0.10.0",
+    "version": "0.10.1",
     "news": {
+      "0.10.1": {
+        "en": "Fork j1s2e3/mychanges2: received telegrams are processed faster again; lastID, rssi and repeated are written alongside the device states instead of before and after them",
+        "de": "Fork j1s2e3/mychanges2: empfangene Telegramme werden wieder schneller verarbeitet; lastID, rssi und repeated werden parallel zu den Gerätezuständen geschrieben statt davor bzw. danach"
+      },
       "0.10.0": {
         "en": "Fork j1s2e3/mychanges2, based on 0.9.3 with the EEP and device fixes of the fork\nreceived telegrams are processed strictly one after another\nerrors in event handlers no longer stop the adapter\nthe serial port is reopened after it was lost, also after a USB disconnect that serialport does not report\nechoes of own telegrams are ignored, values sent to devices are rounded and limited\nthe repeater setting is read back from the gateway, negative gateway answers are logged as warnings",
         "de": "Fork j1s2e3/mychanges2, basiert auf 0.9.3 mit den EEP- und Gerätekorrekturen des Forks\nempfangene Telegramme werden strikt nacheinander verarbeitet\nFehler in Ereignis-Handlern beenden den Adapter nicht mehr\ndie serielle Schnittstelle wird nach einem Ausfall neu geöffnet, auch wenn serialport das Abziehen des USB-Sticks nicht meldet\nEchos eigener Telegramme werden ignoriert, Werte an Geräte werden gerundet und begrenzt\ndie Repeater-Einstellung wird vom Gateway zurückgelesen, Fehlerantworten des Gateways erscheinen als Warnung"

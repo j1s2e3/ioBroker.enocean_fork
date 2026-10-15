@@ -191,6 +191,9 @@ To test telegram handling create a channel with name development and in this cha
 
 ## Changelog
 
+### 0.10.1 (2026-10-15)
+* (j1s2e3) received telegrams: write lastID, rssi and repeated alongside the device states (with the receive queue of 0.10.0 they delayed every telegram); create the object repeated once per device
+
 ### 0.10.0 (2026-10-15)
 * (j1s2e3) fork release (branch mychanges2), based on 0.9.3 with the EEP and device fixes of the fork (Eltako FB55B/FB65B, FD62/FL62, TF-13-20 set point rounding, TF-13-21 byte order)
 * (j1s2e3) process received telegrams strictly one after another
