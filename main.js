@@ -19,6 +19,7 @@ const HandleType2 = require('./lib/tools/Packet_handler').handleType2;
 const HandleType4 = require('./lib/tools/Packet_handler').handleType4;
 const HandleType10 = require('./lib/tools/Packet_handler').handleType10;
 const HandleTeachIn = require('./lib/tools/Packet_handler').handleTeachIn;
+const ReceiveQueue = require('./lib/tools/ReceiveQueue');
 
 const jsonLogic = require('json-logic-js');
 
@@ -40,6 +41,11 @@ let tcpReconnectCounter = 0;
 
 let teachinMethod = null;
 let timeoutQueue, timeoutWait, timeoutTeachin, timeoutGateway;
+
+// Received telegrams are processed one after another; one that takes longer than this is left behind
+const RX_TIMEOUT_MS = 10 * 1000;
+// Warn when this many received telegrams are waiting
+const RX_WARN_PENDING = 50;
 
 
 class Enocean extends utils.Adapter {
@@ -64,6 +70,16 @@ class Enocean extends utils.Adapter {
 		this.deviceManagement = new dmEnocean(this);
 
 		this.eepList = EEPList;
+
+		// All received packets (serial, TCP, development.telegram) go through this queue
+		this.rxQueue = new ReceiveQueue((data) => this.parseMessage(data), {
+			timeoutMs: RX_TIMEOUT_MS,
+			warnPending: RX_WARN_PENDING,
+			log: {
+				warn: (msg) => this.log.warn(msg),
+				error: (msg) => this.log.error(msg),
+			},
+		});
 	}
 
 	/**
@@ -184,7 +200,7 @@ class Enocean extends utils.Adapter {
 				case 'development.telegram': {
 					if(state.val !== null && state.val !== undefined && state.val !== '') {
 						const hex = Buffer.from(state.val.toString(), 'hex');
-						await this.parseMessage(hex);
+						this.rxQueue.push(hex);
 					}
 					break;
 				}
@@ -513,14 +529,12 @@ class Enocean extends utils.Adapter {
 
 			this.sendQueue();
 
-			SERIALPORT_PARSER.on('data', async (data) => {
-			  this.setState('gateway.lastTelegram', {val: data.toString('hex'), ack: true});
-				this.log.debug(data.toString('hex'));
-				try {
-					await this.parseMessage(data);
-				} catch (error) {
-					this.log.error(error);
-				}
+			SERIALPORT_PARSER.on('data', (data) => {
+				const hex = data.toString('hex');
+				// diagnostic state only: a failed write must not end the adapter
+				Promise.resolve(this.setState('gateway.lastTelegram', {val: hex, ack: true})).catch(() => {});
+				this.log.debug(hex);
+				this.rxQueue.push(data);
 			});
 		});
 
@@ -553,13 +567,9 @@ class Enocean extends utils.Adapter {
 
 		this.sendQueue();
 
-		SERIALPORT_PARSER.on('data', async (data) => {
+		SERIALPORT_PARSER.on('data', (data) => {
 			this.log.debug(data.toString('hex'));
-			try {
-				await this.parseMessage(data);
-			} catch (error) {
-				this.log.error(error);
-			}
+			this.rxQueue.push(data);
 		});
 
 
@@ -603,6 +613,7 @@ class Enocean extends utils.Adapter {
 				if (teachin) {
 					if (teachin.val === false) {
 						const telegram = new HandleType1(this, esp3packet);
+						await telegram.done;
 						await this.setStateAsync('gateway.lastID', {val: telegram.senderID, ack: true});
 					} else if (teachin.val === true && teachinMethod !== null) {
 						const telegram = new RadioTelegram(esp3packet);
@@ -634,6 +645,7 @@ class Enocean extends utils.Adapter {
 				if (teachin) {
 					if (teachin.val === false) {
 						const telegram = new HandleType1(this, esp3packet);
+						await telegram.done;
 						await this.setStateAsync('gateway.lastID', {val: telegram.senderID, ack: true});
 					} else if (teachin.val === true && teachinMethod !== null) {
 						const telegram = new RadioTelegram(esp3packet);
@@ -673,6 +685,7 @@ class Enocean extends utils.Adapter {
 				if (teachin) {
 					if (teachin.val === false){
 						const telegram = new HandleType10(this, esp3packet);
+						await telegram.done;
 						await this.setStateAsync('gateway.lastID', {val: telegram.senderID, ack: true});
 					} else {
 						if (teachinMethod !== null) {
