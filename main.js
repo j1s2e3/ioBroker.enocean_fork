@@ -46,6 +46,15 @@ let timeoutQueue, timeoutWait, timeoutTeachin, timeoutGateway;
 const RX_TIMEOUT_MS = 10 * 1000;
 // Warn when this many received telegrams are waiting
 const RX_WARN_PENDING = 50;
+// Serial port lost or not available: delays before the next attempt to open it (the last one repeats)
+const SERIAL_RECONNECT_MS = [5000, 10000, 20000, 40000, 60000];
+// Only a port that stayed open this long starts again with the first delay (a flapping stick backs off)
+const SERIAL_STABLE_MS = 60 * 1000;
+// Check of the open serial port (USB disconnect without 'close' event, see startSerialWatchdog)
+const SERIAL_CHECK_MS = 10 * 1000;
+// Telegrams waiting longer than this in the send queue are dropped. The scripts confirm and repeat their
+// commands themselves; older ones would only be outdated duplicates after a reconnect.
+const SEND_MAX_AGE_MS = 10 * 1000;
 
 
 class Enocean extends utils.Adapter {
@@ -86,6 +95,22 @@ class Enocean extends utils.Adapter {
 				error: (msg) => this.log.error(msg),
 			},
 		});
+
+		// Serial port reopening (openSerialPort) and send queue; instance values so tests can shorten them
+		this.serialReconnectMs = SERIAL_RECONNECT_MS;
+		this.serialStableMs = SERIAL_STABLE_MS;
+		this.serialCheckMs = SERIAL_CHECK_MS;
+		this.sendMaxAgeMs = SEND_MAX_AGE_MS;
+		this.serialAttempt = 0;
+		this.serialReconnectTimer = null;
+		this.serialWatchdog = null;
+		this.serialCheck = null;
+		this.serialWasOpen = false;
+		this.serialOpenedAt = 0;
+		// the port whose start-up is done and whose data listener is attached; only then is sent to it
+		this.serialReady = null;
+		this.sendLoopStarted = false;
+		this.unloading = false;
 	}
 
 	/**
@@ -119,16 +144,8 @@ class Enocean extends utils.Adapter {
 
 		AVAILABLE_PORTS = ports.map(p => p.path);
 
-		if (this.config.serialport && this.config.ser2net === false && this.config.gateway === 'usb300' || this.config.gateway === 'fgw14-usb') {
-			SERIAL_PORT = new SerialPort({ path: this.config.serialport, baudRate: 57600});
-
-			if (this.config.gateway === 'fgw14-usb') {
-				SERIALPORT_PARSER = SERIAL_PORT.pipe(new SERIALPORT_PARSER_CLASS.esp2parser());
-			} else {
-				SERIALPORT_PARSER = SERIAL_PORT.pipe(new SERIALPORT_PARSER_CLASS.esp3parser());
-			}
-
-			await this.packetListenerSerial();
+		if (this.config.serialport && this.config.ser2net === false && (this.config.gateway === 'usb300' || this.config.gateway === 'fgw14-usb')) {
+			this.openSerialPort();
 		}
 
 		if (this.config.ser2net === true || this.config.gateway === 'all-smart'){
@@ -150,12 +167,15 @@ class Enocean extends utils.Adapter {
 	 * @param {() => void} callback
 	 */
 	onUnload(callback) {
+		this.unloading = true;
+		clearTimeout(this.serialReconnectTimer);
+		clearInterval(this.serialWatchdog);
 		clearTimeout(timeoutWait);
 		clearTimeout(timeoutQueue);
 		clearTimeout(timeoutTeachin);
 		clearTimeout(timeoutGateway);
 		try {
-			if (SERIAL_PORT !== null) {
+			if (SERIAL_PORT !== null && SERIAL_PORT.isOpen) {
 				SERIAL_PORT.close();
 			}
 
@@ -365,7 +385,7 @@ class Enocean extends utils.Adapter {
 							break;
 						}
 
-						this.queue.push({'data': finalData, 'optionaldata': optionalData, 'packettype': 0x01});
+						this.queue.push({'data': finalData, 'optionaldata': optionalData, 'packettype': 0x01, 'ts': Date.now()});
 
 						await this.setStateAsync(id, {ack: true});
 						break;
@@ -529,12 +549,138 @@ class Enocean extends utils.Adapter {
 		}
 	}
 
-	async packetListenerSerial() {
-		//open serial port, set adapter state to connected and wait for messages
-		SERIAL_PORT.on('open', async () => {
+	/**
+	 * Open the serial port. If that fails, or the port closes later (USB reset, stick unplugged), try again after
+	 * growing delays (serialReconnectMs). Each attempt uses a new port object and parser, so listeners are never
+	 * registered twice. Before, the adapter stayed deaf and mute after such an event until it was restarted.
+	 */
+	openSerialPort() {
+		this.serialReconnectTimer = null;
+		const port = new SerialPort({ path: this.config.serialport, baudRate: 57600, autoOpen: false });
+		const parser = port.pipe(this.config.gateway === 'fgw14-usb' ?
+			new SERIALPORT_PARSER_CLASS.esp2parser() : new SERIALPORT_PARSER_CLASS.esp3parser());
+		SERIAL_PORT = port;
+		SERIALPORT_PARSER = parser;
+
+		//set adapter state to connected and wait for messages
+		port.on('open', () => {
+			if (this.unloading) {
+				// opened while the adapter was being stopped
+				port.close();
+				return;
+			}
+			this.onSerialOpen(port, parser).catch((e) => this.logError('Initialising the gateway failed', e));
+		});
+
+		//listen to error messages from serial port
+		port.on('error', (err) => {
+			this.log.warn('An error occured at serial port: ' + err);
+		});
+
+		//listen to close serial port
+		port.on('close', () => {
+			if (port !== SERIAL_PORT || this.unloading) {
+				return;
+			}
+			this.setState('info.connection', {val: false, ack: true});
+			if (this.serialOpenedAt && Date.now() - this.serialOpenedAt >= this.serialStableMs) {
+				this.serialAttempt = 0;
+			}
+			this.serialOpenedAt = 0;
+			this.scheduleSerialReconnect('The serial port was closed');
+		});
+
+		port.open((err) => {
+			if (err && port === SERIAL_PORT && !this.unloading) {
+				this.scheduleSerialReconnect(`Cannot open serial port ${this.config.serialport}: ${err.message || err}`);
+			}
+		});
+	}
+
+	/**
+	 * @param {string} reason for the log
+	 */
+	scheduleSerialReconnect(reason) {
+		if (this.unloading || this.serialReconnectTimer) {
+			return;
+		}
+		const delays = this.serialReconnectMs;
+		const delay = delays[Math.min(this.serialAttempt, delays.length - 1)];
+		this.serialAttempt++;
+		// first three attempts, then every tenth: the log stays readable while the stick is missing
+		if (this.serialAttempt <= 3 || this.serialAttempt % 10 === 0) {
+			this.log.warn(`${reason}. Next attempt in ${delay / 1000} s (attempt ${this.serialAttempt})`);
+		}
+		this.serialReconnectTimer = setTimeout(() => this.openSerialPort(), delay);
+	}
+
+	/**
+	 * Check the open serial port every serialCheckMs. After a USB disconnect, serialport 10 on Linux does not always
+	 * emit 'close' or 'error': reading the hung-up tty returns 0 bytes, which the binding retries at once, forever
+	 * (one CPU core busy, growing memory, the port still "open"). tcdrain() on such a tty fails (EIO); then the port
+	 * is closed, which starts the reconnect. A drain() that has not returned after 3 checks counts as failed.
+	 */
+	startSerialWatchdog() {
+		if (this.serialWatchdog) {
+			return;
+		}
+		this.serialWatchdog = setInterval(() => {
+			const port = SERIAL_PORT;
+			if (!port || !port.isOpen || port !== this.serialReady || this.unloading) {
+				return;
+			}
+			const pending = this.serialCheck;
+			if (pending && pending.port === port) {
+				// the last drain() has not returned yet; do not stack another one
+				if (++pending.ticks >= 3) {
+					this.serialCheck = null;
+					this.closeUnresponsivePort(port, 'drain does not return');
+				}
+				return;
+			}
+			const check = {port: port, ticks: 0};
+			this.serialCheck = check;
+			port.drain((err) => {
+				if (this.serialCheck === check) {
+					this.serialCheck = null;
+				}
+				if (err) {
+					this.closeUnresponsivePort(port, err.message || err);
+				}
+			});
+		}, this.serialCheckMs);
+	}
+
+	/**
+	 * @param {any} port
+	 * @param {string} reason
+	 */
+	closeUnresponsivePort(port, reason) {
+		if (port === SERIAL_PORT && port.isOpen && !this.unloading) {
+			this.log.warn(`Serial port ${this.config.serialport} does not respond (${reason}), closing it`);
+			port.close();
+		}
+	}
+
+	/**
+	 * Serial port is open: read the gateway, start sending, listen for telegrams.
+	 * @param {any} port
+	 * @param {any} parser
+	 */
+	async onSerialOpen(port, parser) {
+		if (port !== SERIAL_PORT) {
+			return;
+		}
+		if (this.serialWasOpen) {
+			this.log.info(`Serial port ${this.config.serialport} is open again`);
+		}
+		this.serialWasOpen = true;
+		this.serialOpenedAt = Date.now();
+		try {
 			if(this.config.gateway !== 'fgw14-usb') {
 				const connected = await this.getGatewayInfo();
-				if (connected === true) {
+				// the port may have closed again while the gateway was read
+				if (connected === true && port === SERIAL_PORT && port.isOpen) {
 					this.setState('info.connection', {val: true, ack: true});
 				}
 
@@ -544,32 +690,27 @@ class Enocean extends utils.Adapter {
 				//Not supported by USB300 await this.readMailboxStatus();
 			} else {
 				await this.dummyGatewayInfo();
-				this.setState('info.connection', {val: true, ack: true});
+				if (port === SERIAL_PORT && port.isOpen) {
+					this.setState('info.connection', {val: true, ack: true});
+				}
 			}
-
-			this.sendQueue();
-
-			SERIALPORT_PARSER.on('data', (data) => {
-				const hex = data.toString('hex');
-				// diagnostic state only: a failed write must not end the adapter
-				Promise.resolve(this.setState('gateway.lastTelegram', {val: hex, ack: true})).catch(() => {});
-				this.log.debug(hex);
-				this.rxQueue.push(data);
-			});
-		});
-
-
-		//listen to error messages from serial port
-		SERIAL_PORT.on('error', (err) => {
-			this.log.warn('An error occured at serial port: ' + err);
-		});
-
-		//listen to close serial port
-		SERIAL_PORT.on('close', () => {
-			this.log.info('The serial port was closed.');
-			this.setState('info.connection', {val: false, ack: true});
-		});
-
+		} finally {
+			// also after an error above, otherwise the adapter would not receive anything; not for a port that was
+			// closed meanwhile (a newer attempt takes over)
+			if (port === SERIAL_PORT && port.isOpen) {
+				parser.on('data', (data) => {
+					const hex = data.toString('hex');
+					// diagnostic state only: a failed write must not end the adapter
+					Promise.resolve(this.setState('gateway.lastTelegram', {val: hex, ack: true})).catch(() => {});
+					this.log.debug(hex);
+					this.rxQueue.push(data);
+				});
+				// queued telegrams go out only now: device confirmations arriving during the start-up would be lost
+				this.serialReady = port;
+				this.startSendQueue();
+				this.startSerialWatchdog();
+			}
+		}
 	}
 
 	async packetListenerTCP() {
@@ -585,7 +726,8 @@ class Enocean extends utils.Adapter {
 			this.setState('info.connection', {val: true, ack: true});
 		}
 
-		this.sendQueue();
+		// once: before, every reconnect started another send loop
+		this.startSendQueue();
 
 		SERIALPORT_PARSER.on('data', (data) => {
 			this.log.debug(data.toString('hex'));
@@ -778,6 +920,10 @@ class Enocean extends utils.Adapter {
 		let data, appVersion_main, appVersion_beta, appVersion_alpha, appVersion_build, apiVersion_main, apiVersion_beta, apiVersion_alpha, apiVersion_build, chipId, chipVersion, appDescription, repEnable, repLevel, frequency, protocol, baseId;
 		let senderIDs = {};
 		let connected = false;
+		// serial: the port this start-up belongs to. If it was closed meanwhile, a newer start-up takes over; this
+		// one must neither send to the new port nor write its incomplete results. (TCP: port is null.)
+		const port = SERIAL_PORT;
+		const replaced = () => port !== SERIAL_PORT || (port !== null && !port.isOpen);
 		//03: CO_RD_VERSION
 		data = Buffer.from([0x03]);
 		const rd_version = await this.sendData(this, data, null, 5);
@@ -802,6 +948,9 @@ class Enocean extends utils.Adapter {
 			}
 		}
 
+		if (replaced()) {
+			return false;
+		}
 		//10: CO_RD_REPEATER
 		data = Buffer.from([0x0A]);
 		const rd_repeater = await this.sendData(this, data, null, 5);
@@ -819,6 +968,9 @@ class Enocean extends utils.Adapter {
 			}
 		}
 
+		if (replaced()) {
+			return false;
+		}
 		//37: CO_GET_FREQUENCY_INFO
 		data = Buffer.from([0x25]);
 		const get_frequency = await this.sendData(this, data, null, 5);
@@ -834,6 +986,9 @@ class Enocean extends utils.Adapter {
 			}
 		}
 
+		if (replaced()) {
+			return false;
+		}
 		//08: CO_RD_IDBASE
 		data = Buffer.from([0x08]);
 		const rd_idbase = await this.sendData(this, data, null, 5);
@@ -850,6 +1005,9 @@ class Enocean extends utils.Adapter {
 			}
 		}
 
+		if (replaced()) {
+			return false;
+		}
 		//Smart ACK 06: SA_RD_LEARNDCLIENTS
 		data = Buffer.from([0x06]);
 		const sa_rd_learndclients = await this.sendData(this, data, null, 6);
@@ -885,6 +1043,10 @@ class Enocean extends utils.Adapter {
 		} catch (e) {
 			this.log.error(e);
 		}*/
+
+		if (replaced()) {
+			return false;
+		}
 
 		const gatewayObject = {
 			native: {
@@ -1063,8 +1225,49 @@ class Enocean extends utils.Adapter {
 		});
 	}
 
+	/**
+	 * Start the send loop once
+	 */
+	startSendQueue() {
+		if (!this.sendLoopStarted) {
+			this.sendLoopStarted = true;
+			this.sendQueue();
+		}
+	}
+
+	/**
+	 * @returns {boolean} false while the serial port is closed or its start-up is not done; ser2net/TCP is not
+	 * checked (unchanged)
+	 */
+	gatewayWritable() {
+		if (this.config.ser2net === false && this.config.gateway !== 'all-smart') {
+			return SERIAL_PORT !== null && SERIAL_PORT.isOpen === true && SERIAL_PORT === this.serialReady;
+		}
+		return true;
+	}
+
+	/**
+	 * Drop queued telegrams that waited longer than sendMaxAgeMs (gateway gone), oldest first
+	 */
+	dropStaleTelegrams() {
+		const now = Date.now();
+		let dropped = 0;
+		while (this.queue.length > 0 && this.queue[0].ts !== undefined && now - this.queue[0].ts > this.sendMaxAgeMs) {
+			this.queue.splice(0, 1);
+			dropped++;
+		}
+		if (dropped > 0) {
+			this.log.warn(`${dropped} telegram(s) not sent within ${this.sendMaxAgeMs / 1000} s (gateway not available), dropped`);
+		}
+	}
+
 	async sendQueue(){
-		if(this.queue.length > 0){
+		if (this.unloading) {
+			return;
+		}
+		this.dropStaleTelegrams();
+		// while the serial port is closed, telegrams stay queued; before, they were written to the closed port
+		if(this.queue.length > 0 && this.gatewayWritable()){
 			const data = this.queue[0].data;
 			const optionalData = this.queue[0].optionaldata;
 			const packetType = this.queue[0].packettype;

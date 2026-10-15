@@ -22,6 +22,8 @@ const NS = 'enocean.0';
 
 /** @type {TestEnv | null} the environment the next adapter instance belongs to */
 let current = null;
+/** @type {TestEnv | null} the last started environment (for ports created after stop(), which must not happen) */
+let last = null;
 
 function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -275,10 +277,13 @@ class FakeSerialPort extends EventEmitter {
 
 	constructor(options) {
 		super();
-		this.env = current;
+		this.env = current || last;
 		this.path = options.path;
 		this.isOpen = false;
+		this.hungUp = false;
+		this.drainHangs = false;
 		this.parser = null;
+		this.sent = [];
 		this.env.ports.push(this);
 		if (options.autoOpen !== false) {
 			setImmediate(() => this.open());
@@ -292,7 +297,7 @@ class FakeSerialPort extends EventEmitter {
 
 	open(callback) {
 		this.env.openAttempts++;
-		setImmediate(() => {
+		setTimeout(() => {
 			if (!this.env.devicePresent) {
 				const err = new Error(`No such file or directory, cannot open ${this.path}`);
 				if (callback) {
@@ -307,7 +312,7 @@ class FakeSerialPort extends EventEmitter {
 			if (callback) {
 				callback(null);
 			}
-		});
+		}, this.env.openDelayMs);
 	}
 
 	write(buffer, callback) {
@@ -317,6 +322,21 @@ class FakeSerialPort extends EventEmitter {
 			this.env.heldWrites.push(data);
 			return true;
 		}
+		if (this.hungUp) {
+			// like serialport 10: EIO from the hung-up tty; the stream reports the error and closes (twice)
+			const err = new Error('EIO: i/o error, write');
+			setImmediate(() => {
+				if (callback) {
+					callback(err);
+				}
+				this.isOpen = false;
+				this.emit('error', err);
+				this.emit('close', err);
+				this.emit('close', err);
+			});
+			return false;
+		}
+		this.sent.push(data);
 		this.env.sent.push(data);
 		if (callback) {
 			setImmediate(() => callback(null));
@@ -327,15 +347,30 @@ class FakeSerialPort extends EventEmitter {
 
 	close(callback) {
 		setImmediate(() => {
-			const wasOpen = this.isOpen;
+			if (!this.isOpen) {
+				// like serialport 10
+				const err = new Error('Port is not open');
+				if (callback) {
+					callback(err);
+				} else {
+					this.emit('error', err);
+				}
+				return;
+			}
 			this.isOpen = false;
 			if (callback) {
 				callback(null);
 			}
-			if (wasOpen) {
-				this.emit('close');
-			}
+			this.emit('close');
 		});
+	}
+
+	/** tcdrain(); fails on a hung-up tty, never returns with drainHangs */
+	drain(callback) {
+		if (this.drainHangs) {
+			return;
+		}
+		setImmediate(() => callback(this.hungUp ? new Error('EIO: i/o error, drain') : null));
 	}
 
 	/** USB stick gone: the port closes on its own */
@@ -347,9 +382,17 @@ class FakeSerialPort extends EventEmitter {
 		this.emit('close', err);
 	}
 
+	/**
+	 * USB stick gone, but serialport 10 does not notice: no 'close', no 'error', isOpen stays true, nothing is
+	 * received any more (on Linux the read of the hung-up tty returns 0 bytes, which the binding retries forever)
+	 */
+	hangUp() {
+		this.hungUp = true;
+	}
+
 	/** bytes from the gateway */
 	inject(buffer) {
-		if (this.parser) {
+		if (this.parser && !this.hungUp) {
 			this.parser.write(buffer);
 		}
 	}
@@ -410,16 +453,21 @@ class TestEnv {
 		this.unhandled = [];
 		// gateway
 		this.devicePresent = true;
+		this.openDelayMs = 0;
+		this.answerDelayMs = 2;
 		this.ports = [];
 		this.openAttempts = 0;
 		this.sent = [];
 		this.heldWrites = [];
 		this.radio = [];
+		this.radioTimes = [];
 		this.baseId = 'ffcf2780';
 		this.repeater = { mode: 1, level: 1 };
 		this.repeaterWrites = [];
 		this.repeaterAnswer = 0x00;
 		this.radioAnswer = 0x00;
+		/** @type {null | ((port: FakeSerialPort, type: number, data: Buffer) => void)} called for each packet sent */
+		this.onPacket = null;
 		this.adapterInstance = null;
 
 		this.onUnhandled = (e) => this.unhandled.push(e);
@@ -486,6 +534,7 @@ class TestEnv {
 			throw new Error('harness: another TestEnv is still running, call stop() first');
 		}
 		current = this;
+		last = this;
 		const mainPath = path.join(ROOT, 'main.js');
 		delete require.cache[require.resolve(mainPath)];
 		const factory = require(mainPath);
@@ -524,7 +573,8 @@ class TestEnv {
 			!!port &&
 			port.isOpen &&
 			!!port.parser &&
-			port.parser.listenerCount('data') > 0
+			port.parser.listenerCount('data') > 0 &&
+			this.adapter.serialReady === port
 		);
 	}
 
@@ -585,6 +635,10 @@ class TestEnv {
 		const dataLength = packet.readUInt16BE(1);
 		const type = packet[4];
 		const data = packet.slice(6, 6 + dataLength);
+		if (this.onPacket) {
+			// test hook, e.g. to disconnect at a certain point; no answer from a closed port
+			this.onPacket(port, type, data);
+		}
 		let answer = null;
 		let optional = [];
 		if (type === 5) {
@@ -622,11 +676,12 @@ class TestEnv {
 		} else if (type === 1) {
 			// RADIO_ERP1 to send
 			this.radio.push(data);
+			this.radioTimes.push(Date.now());
 			answer = Buffer.from([this.radioAnswer]);
 		}
 		if (answer) {
 			const response = esp3(2, answer, optional);
-			setTimeout(() => port.isOpen && port.inject(response), 2);
+			setTimeout(() => port.isOpen && port.inject(response), this.answerDelayMs);
 		}
 	}
 }
