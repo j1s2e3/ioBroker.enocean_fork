@@ -111,6 +111,13 @@ class Enocean extends utils.Adapter {
 		this.serialReady = null;
 		this.sendLoopStarted = false;
 		this.unloading = false;
+
+		// Base ID of the gateway as number, set by getGatewayInfo (see isOwnTelegram)
+		this.baseIdInt = undefined;
+		// packets sent to the gateway that wait for its RESPONSE, oldest first (see checkResponse)
+		this.awaitingResponse = [];
+		// setting the repeater: one change at a time (see setRepeater)
+		this.repeaterTask = Promise.resolve();
 	}
 
 	/**
@@ -163,6 +170,24 @@ class Enocean extends utils.Adapter {
 	}
 
 	/**
+	 * Value from a state for a telegram field. If it does not fit (not a number, below 0, too large for the field),
+	 * a warning is logged and 0 or the largest value of the field is sent.
+	 * @param {number} value integer (rounded value of the state, or result of value_out)
+	 * @param {number|string} bitsize
+	 * @param {string} id state that triggered the telegram
+	 * @param {string} shortcut field
+	 * @param {any} original value of the state
+	 * @returns {number}
+	 */
+	fieldValue(value, bitsize, id, shortcut, original) {
+		const fitted = fitToField(value, bitsize);
+		if (fitted !== value) {
+			this.log.warn(`${id}: ${shortcut} = ${original} does not fit into the telegram (${bitsize} bit), sending ${fitted}`);
+		}
+		return fitted;
+	}
+
+	/**
 	 * Is called when adapter shuts down - callback has to be called under any circumstances!
 	 * @param {() => void} callback
 	 */
@@ -212,26 +237,21 @@ class Enocean extends utils.Adapter {
 						}, 60 * 1000);
 					}
 					break;
-				case 'gateway.repeater.level': {
-					const data = ByteArray.from([0x09, 0x00, 0x00]);
-					const mode = await this.getStateAsync('gateway.repeater.mode');
-					if (mode !== null && mode !== undefined) {
-						data.setValue(mode.val, 8, 8);
-						data.setValue(state.val, 16, 8);
-						await this.sendData(this, data, null, 5);
+				case 'gateway.repeater.level':
+				case 'gateway.repeater.mode':
+					// ack=true: read from the gateway (at start or by setRepeater). Before, the adapter wrote the
+					// setting it had just read back into the gateway at every start (twice), and a change by hand
+					// was never checked.
+					if (state.ack === false) {
+						// one change at a time, otherwise two quick changes would take each other's answers. The new
+						// value is passed on: the read-back of an earlier change overwrites the state meanwhile.
+						const change = objName === 'gateway.repeater.mode' ? {mode: state.val} : {level: state.val};
+						this.repeaterTask = this.repeaterTask
+							.then(() => this.setRepeater(change))
+							.catch((e) => this.logError('Setting the repeater failed', e));
+						await this.repeaterTask;
 					}
 					break;
-				}
-				case 'gateway.repeater.mode': {
-					const data = ByteArray.from([0x09, 0x00, 0x00]);
-					const level = await this.getStateAsync('gateway.repeater.level');
-					if (level !== null && level !== undefined) {
-						data.setValue(state.val, 8, 8);
-						data.setValue(level.val, 16, 8);
-						await this.sendData(this, data, null, 5);
-					}
-					break;
-				}
 				case 'development.telegram': {
 					if(state.val !== null && state.val !== undefined && state.val !== '') {
 						const hex = Buffer.from(state.val.toString(), 'hex');
@@ -313,9 +333,10 @@ class Enocean extends utils.Adapter {
 										//Check if there is a converion needed
 										if(datafield[d].value_out) {
 											const convertedValue = jsonLogic.apply(datafield[d].value_out, {'value': value});
-											data.setValue(parseInt(convertedValue), bitoffs, bitsize);
+											data.setValue(this.fieldValue(parseInt(convertedValue), bitsize, id, short, value), bitoffs, bitsize);
 										} else if (value) {
-											data.setValue(value, bitoffs, bitsize);
+											// e.g. LVL 12.5 % from a GUI; before it was sent as 49 % or a broken telegram
+											data.setValue(this.fieldValue(Math.round(Number(value)), bitsize, id, short, value), bitoffs, bitsize);
 										}
 										break;
 									} else if (datafield[d].shortcut === short && datafield[d].bitoffs !== null && datafield[d].bitsize !== null && datafield[d].value !== null) {
@@ -676,6 +697,8 @@ class Enocean extends utils.Adapter {
 		}
 		this.serialWasOpen = true;
 		this.serialOpenedAt = Date.now();
+		// a repeater change still under way would take the answers of the start-up
+		await this.repeaterTask;
 		try {
 			if(this.config.gateway !== 'fgw14-usb') {
 				const connected = await this.getGatewayInfo();
@@ -698,11 +721,13 @@ class Enocean extends utils.Adapter {
 			// also after an error above, otherwise the adapter would not receive anything; not for a port that was
 			// closed meanwhile (a newer attempt takes over)
 			if (port === SERIAL_PORT && port.isOpen) {
+				this.awaitingResponse = []; // the answers during the start-up went to waitForResponse
 				parser.on('data', (data) => {
 					const hex = data.toString('hex');
 					// diagnostic state only: a failed write must not end the adapter
 					Promise.resolve(this.setState('gateway.lastTelegram', {val: hex, ack: true})).catch(() => {});
 					this.log.debug(hex);
+					this.checkResponse(data);
 					this.rxQueue.push(data);
 				});
 				// queued telegrams go out only now: device confirmations arriving during the start-up would be lost
@@ -729,8 +754,10 @@ class Enocean extends utils.Adapter {
 		// once: before, every reconnect started another send loop
 		this.startSendQueue();
 
+		this.awaitingResponse = []; // the answers during the start-up went to waitForResponse
 		SERIALPORT_PARSER.on('data', (data) => {
 			this.log.debug(data.toString('hex'));
+			this.checkResponse(data);
 			this.rxQueue.push(data);
 		});
 
@@ -761,6 +788,102 @@ class Enocean extends utils.Adapter {
 	}
 
 	/**
+	 * Echo of a telegram this gateway sent itself (sender ID within its base ID range), repeated back by a
+	 * repeater: the gateway cannot hear its own original. It is never a device telegram, so it is skipped before
+	 * any database access. About a third of all received frames are such echoes.
+	 * @param {ESP3Packet} esp3packet RADIO_ERP1 or RADIO_SUB_TEL
+	 * @returns {boolean}
+	 */
+	isOwnTelegram(esp3packet) {
+		const data = esp3packet.data;
+		if (this.baseIdInt === undefined || data.length < 6) {
+			return false;
+		}
+		const sender = data.readUInt32BE(data.length - 5);
+		if (sender < this.baseIdInt || sender > this.baseIdInt + 127) {
+			return false;
+		}
+		this.log.debug(`Echo of own telegram (sender ${sender.toString(16)}, repeated ${data[data.length - 1] & 0x0f} times) ignored`);
+		return true;
+	}
+
+	/**
+	 * Every packet from the gateway passes here before the receive queue. A RESPONSE answers the oldest packet sent
+	 * to the gateway that still waits (the gateway answers in order, within some 10 ms). A negative answer, e.g.
+	 * NO FREE BUFFER or DUTY CYCLE LOCK, means the gateway did not do it; this was only visible on debug level.
+	 * @param {Buffer} data
+	 */
+	checkResponse(data) {
+		if (data.length < 7 || data[4] !== 2) {
+			return;
+		}
+		const now = Date.now();
+		while (this.awaitingResponse.length > 0 && now - this.awaitingResponse[0].ts > 1000) {
+			this.awaitingResponse.shift(); // its answer got lost
+		}
+		const sent = this.awaitingResponse.shift();
+		const answer = new HandleType2(this, data).main;
+		if (answer.code !== 'OK') {
+			this.log.warn(`Gateway answered ${answer.code || 'return code ' + data[6]} to ${sent ? sent.hex : 'an unknown packet'}`);
+		}
+	}
+
+	/**
+	 * Write the repeater setting into the gateway (CO_WR_REPEATER), then read it back (CO_RD_REPEATER) into
+	 * gateway.repeater.mode/.level with ack=true. So the states show what the gateway really uses, also if it
+	 * refused the setting.
+	 * @param {{mode?: any, level?: any}} change the value just set by the user; the other one from its state
+	 */
+	async setRepeater(change) {
+		if (!this.gatewayWritable()) {
+			// not during the start-up, which reads the repeater itself: both would take each other's answers
+			this.log.warn(`Gateway not ready, repeater setting not changed (${JSON.stringify(change)})`);
+			return;
+		}
+		const current = async (name) => {
+			const state = await this.getStateAsync(`gateway.repeater.${name}`);
+			return state ? state.val : null;
+		};
+		const mode = 'mode' in change ? change.mode : await current('mode');
+		const level = 'level' in change ? change.level : await current('level');
+		if (mode === null || mode === undefined || level === null || level === undefined) {
+			return;
+		}
+		const wanted = {mode: fitToField(Math.round(Number(mode)), 8), level: fitToField(Math.round(Number(level)), 8)};
+		// Consistent pairs, as other ESP3 hosts send them: off is mode 0 with level 0, on needs a level of 1 or 2.
+		// Switching off with either state turns both off; switching on with either state takes mode 1 or level 1.
+		const changed = 'mode' in change ? 'mode' : 'level';
+		if (wanted[changed] === 0) {
+			wanted.mode = 0;
+			wanted.level = 0;
+		} else if (wanted.mode === 0) {
+			wanted.mode = 1;
+		} else if (wanted.level === 0) {
+			wanted.level = 1;
+		}
+		const text = `mode ${wanted.mode}, level ${wanted.level}`;
+		await this.sendData(this, Buffer.from([0x09, wanted.mode, wanted.level]), null, 5);
+		// during operation, the answer to CO_RD_REPEATER is the only RESPONSE with 3 data bytes; radio telegrams and
+		// CO_WR_REPEATER are answered with 1 byte
+		const response = this.waitForResponse('Get repeater mode and level', 3);
+		response.catch(() => {}); // awaited below; no unhandled rejection if sending fails
+		try {
+			await this.sendData(this, Buffer.from([0x0A]), null, 5);
+			const answer = await response;
+			const got = {mode: answer[7], level: answer[8]};
+			await this.setStateAsync('gateway.repeater.mode', {val: got.mode, ack: true});
+			await this.setStateAsync('gateway.repeater.level', {val: got.level, ack: true});
+			if (got.mode === wanted.mode && got.level === wanted.level) {
+				this.log.info(`Gateway repeater set: ${text}`);
+			} else {
+				this.log.warn(`Gateway did not accept repeater ${text}, it uses mode ${got.mode}, level ${got.level}`);
+			}
+		} catch (e) {
+			this.log.warn(`Gateway repeater ${text}: no answer when reading it back (${e})`);
+		}
+	}
+
+	/**
 	 * Parses a data package from the ESP3 serial interface
 	 * @param {Buffer} data The received data
 	 */
@@ -770,6 +893,9 @@ class Enocean extends utils.Adapter {
 		switch (esp3packet.type) {
 			case 1: // RADIO_ERP1
 			{
+				if (this.isOwnTelegram(esp3packet)) {
+					break;
+				}
 				const teachin = await this.getStateAsync(this.namespace + '.gateway.teachin');
 
 				if (teachin) {
@@ -796,12 +922,16 @@ class Enocean extends utils.Adapter {
 			}
 			case 2: //RESPONSE
 			{
+				// negative answers are logged by checkResponse
 				const telegram = new HandleType2(this, data);
 				this.log.debug('Packet type 2 received: ' + JSON.stringify(telegram.main));
 				break;
 			}
 			case 3: //RADIO_SUB_TEL
 			{//this.log.debug('Radio sub telegram received.');
+				if (this.isOwnTelegram(esp3packet)) {
+					break;
+				}
 				const teachin = await this.getStateAsync(this.namespace + '.gateway.teachin');
 
 				if (teachin) {
@@ -997,6 +1127,7 @@ class Enocean extends utils.Adapter {
 				const returnIdbase = await this.waitForResponse('Get base ID', 5);
 				const telegram = new ResponseTelegram(returnIdbase);
 				baseId = telegram.data.toString('hex');
+				this.baseIdInt = parseInt(baseId, 16);
 				senderIDs = await idRangeCalc(baseId);
 
 				connected = true;
@@ -1172,18 +1303,26 @@ class Enocean extends utils.Adapter {
 	//wait for response from USB Stick/Modul
 	waitForResponse(info, responseLength){
 		info = info ? ': ' + info : '';
+		// the parser of this moment (after a reconnect SERIALPORT_PARSER is a new one)
+		const parser = SERIALPORT_PARSER;
 		return new Promise((resolve, reject) => {
 			const cb = (data) => {
 				//this.log.info(data.toString('hex'));
 				const telegram = new ESP3Packet(data);
-				if(responseLength === telegram.dataLength || responseLength === null){
+				// only RESPONSE packets; a radio telegram of the same length is no answer
+				if(telegram.type === 2 && (responseLength === telegram.dataLength || responseLength === null)){
 					resolve(data);
-					clearTimeout(timeoutGateway);
-					SERIALPORT_PARSER.off('data', cb);
+					clearTimeout(timer);
+					parser.off('data', cb);
 				}
 			};
-			SERIALPORT_PARSER.on('data', cb);
-			timeoutGateway = setTimeout(() => {reject('Timeout for response' + info);}, 1500);
+			parser.on('data', cb);
+			// before, the listener stayed registered for good after a timeout
+			const timer = setTimeout(() => {
+				parser.off('data', cb);
+				reject('Timeout for response' + info);
+			}, 1500);
+			timeoutGateway = timer;
 		});
 	}
 
@@ -1338,6 +1477,13 @@ class Enocean extends utils.Adapter {
 			}
 		}
 
+		if (that.config.gateway !== 'fgw14-usb') {
+			// the gateway answers each ESP3 packet with a RESPONSE (see checkResponse)
+			that.awaitingResponse.push({hex: Buffer.concat(payload).toString('hex'), ts: Date.now()});
+			if (that.awaitingResponse.length > 20) {
+				that.awaitingResponse.shift();
+			}
+		}
 
 		if (that.config.ser2net === false && that.config.gateway !== 'all-smart') {
 			SERIAL_PORT.write(Buffer.concat(payload), (err) => {
@@ -1427,6 +1573,27 @@ async function idRangeCalc(baseId) {
 		result[idHex] = '';
 	}
 	return result;
+}
+
+/**
+ * Fit a value from a state into a telegram field: values below 0 or not a number become 0, values above the
+ * field width become the largest value that fits. ByteArray.setValue writes all bits of its argument, so before
+ * 256 spilled into the next field and -5 was written as 5. Fixed parameters of the EEP files do not pass through
+ * here; some of them deliberately span several bytes.
+ * @param {number} value integer
+ * @param {number|string} bitsize
+ * @returns {number}
+ */
+function fitToField(value, bitsize) {
+	const bits = parseInt(String(bitsize));
+	let v = Number(value);
+	if (!Number.isFinite(v) || v < 0) {
+		v = 0;
+	}
+	if (bits > 0 && bits < 53) {
+		v = Math.min(v, Math.pow(2, bits) - 1);
+	}
+	return v;
 }
 
 function crcESP2(buf) {

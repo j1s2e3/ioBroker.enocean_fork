@@ -254,8 +254,7 @@ describe('serial port: reconnect', function () {
 		await sleep(100);
 		await env.settle();
 
-		// 5:9 = CO_WR_REPEATER: onStateChange still writes the setting just read back into the gateway
-		const commands = env.ports[1].sent.map((p) => `${p[4]}:${p[6].toString(16)}`).filter((c) => c !== '5:9');
+		const commands = env.ports[1].sent.map((p) => `${p[4]}:${p[6].toString(16)}`);
 		assert.deepEqual(commands, ['5:3', '5:a', '5:25', '5:8', '6:6'], 'each start-up command once on the new port');
 		assert.equal(env.objects['enocean.0.gateway'].native.AppVersion, '2.11.1.0');
 		assert.equal(env.logs.error.length, 0, env.logs.error.join(' | '));

@@ -465,6 +465,7 @@ class TestEnv {
 		this.repeater = { mode: 1, level: 1 };
 		this.repeaterWrites = [];
 		this.repeaterAnswer = 0x00;
+		/** @type {number | ((data: Buffer) => number)} return code for radio telegrams */
 		this.radioAnswer = 0x00;
 		/** @type {null | ((port: FakeSerialPort, type: number, data: Buffer) => void)} called for each packet sent */
 		this.onPacket = null;
@@ -677,7 +678,7 @@ class TestEnv {
 			// RADIO_ERP1 to send
 			this.radio.push(data);
 			this.radioTimes.push(Date.now());
-			answer = Buffer.from([this.radioAnswer]);
+			answer = Buffer.from([typeof this.radioAnswer === 'function' ? this.radioAnswer(data) : this.radioAnswer]);
 		}
 		if (answer) {
 			const response = esp3(2, answer, optional);
