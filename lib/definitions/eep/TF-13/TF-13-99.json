@@ -83,21 +83,6 @@
                 "def": false
             },
             "native": {}
-        },
-        "LM": {
-            "type": "state",
-            "common": {
-                "name": {
-                    "en": "Learning mode",
-                    "de": "Lernmodus"
-                },
-                "role": "state",
-                "type": "boolean",
-                "read": true,
-                "write": true,
-                "def": false
-            },
-            "native": {}
         }
     },
     "case": [
@@ -138,13 +123,6 @@
                     "bitoffs": "28",
                     "bitsize": "1",
                     "value": 1
-                },
-                {
-                    "data": "Learning mode",
-                    "shortcut": "LM",
-                    "bitoffs": "26",
-                    "bitsize": "1",
-                    "value_out": {"if":[{"var":"value"},1,0]}
                 },
                 {
                     "data": "Block level",
@@ -201,13 +179,6 @@
                     "value": 1
                 },
                 {
-                    "data": "Learning mode",
-                    "shortcut": "LM",
-                    "bitoffs": "26",
-                    "bitsize": "1",
-                    "value_out": {"if":[{"var":"value"},1,0]}
-                },
-                {
                     "data": "Block level",
                     "shortcut": "BL",
                     "bitoffs": "29",
@@ -260,13 +231,6 @@
                     "bitoffs": "28",
                     "bitsize": "1",
                     "value": 1
-                },
-                {
-                    "data": "Learning mode",
-                    "shortcut": "LM",
-                    "bitoffs": "26",
-                    "bitsize": "1",
-                    "value_out": {"if":[{"var":"value"},1,0]}
                 },
                 {
                     "data": "Block level",
@@ -413,20 +377,6 @@
                     "bitoffs": "8",
                     "bitsize": "8",
                     "value": {"var": "value"}
-                },
-                {
-                    "data": "Learning mode",
-                    "shortcut": "LM",
-                    "bitoffs": "26",
-                    "bitsize": "1",
-                    "value": {"==": [{"var": "value"},1]}
-                },
-                {
-                    "data": "Block level",
-                    "shortcut": "BL",
-                    "bitoffs": "29",
-                    "bitsize": "1",
-                    "value": {"==": [{"var": "value"},1]}
                 },
                 {
                     "data": "On",
