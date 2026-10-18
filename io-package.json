@@ -1,8 +1,12 @@
 {
   "common": {
     "name": "enocean",
-    "version": "0.10.2",
+    "version": "0.10.3",
     "news": {
+      "0.10.3": {
+        "en": "Fork j1s2e3/mychanges2: FD62 (TF-13-99) and FL62/FR62 (TF-13-11) get no learn-mode bit with switching commands, and states are no longer read from bits the confirmation does not contain; new FD62 devices get TF-13-99, also from the device manager and the automatic teach-in; teach-in telegram of TF-13-07 (FUD61NPN, FUD71, FSUD and others) as Eltako specifies",
+        "de": "Fork j1s2e3/mychanges2: FD62 (TF-13-99) und FL62/FR62 (TF-13-11) bekommen mit Schaltbefehlen kein Lernmodus-Bit mehr, und States werden nicht mehr aus Bits gelesen, die die Bestätigung nicht enthält; neue FD62 bekommen TF-13-99, auch über die Geräteverwaltung und das automatische Anlernen; Lerntelegramm von TF-13-07 (FUD61NPN, FUD71, FSUD u. a.) wie von Eltako vorgegeben"
+      },
       "0.10.2": {
         "en": "Fork j1s2e3/mychanges2: commands are sent sooner; parameters are acknowledged after the telegram is queued, a telegram goes out at once when the gateway is idle",
         "de": "Fork j1s2e3/mychanges2: Befehle werden schneller gesendet; Parameter werden nach dem Einreihen des Telegramms quittiert, ein Telegramm geht sofort raus, wenn das Gateway frei ist"

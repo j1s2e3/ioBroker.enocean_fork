@@ -191,6 +191,12 @@ To test telegram handling create a channel with name development and in this cha
 
 ## Changelog
 
+### 0.10.3 (2026-10-18)
+* (j1s2e3) TF-13-07 (Eltako dimmers such as FUD61NPN, FUD71, FSUD): teach-in telegram E0 40 0D 80 as Eltako specifies (DB1 was 0xD0)
+* (j1s2e3) TF-13-99 (FD62NP/FD62NPN): no learn-mode bit in off, on and dim commands; block level and learn mode are no longer read from the confirmation; new devices get no state LM
+* (j1s2e3) TF-13-11 (FL62, FR62): no learn-mode bit in off and on commands; LM and SB are no longer read from 4BS telegrams; new devices get no state LM
+* (j1s2e3) FD62NP/FD62NPN: the device manager and the automatic teach-in create TF-13-99 instead of TF-13-07/TF-13-06
+
 ### 0.10.2 (2026-10-15)
 * (j1s2e3) commands: acknowledge the parameter states after the telegram is queued, read the gateway object only for devices without own sender ID, send at once when the gateway has been idle for 50 ms
 
