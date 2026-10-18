@@ -43,21 +43,6 @@
         "def": false
       },
       "native": {}
-    },
-    "LM": {
-      "type": "state",
-      "common": {
-        "name": {
-          "en": "Learning mode",
-          "de": "Lernmodus"
-        },
-        "role": "state",
-        "type": "boolean",
-        "read": true,
-        "write": true,
-        "def": false
-      },
-      "native": {}
     }
   },
   "case": [
@@ -91,13 +76,6 @@
           "bitoffs": "16",
           "bitsize": "8",
           "value": 0
-        },
-        {
-          "data": "Learning mode",
-          "shortcut": "LM",
-          "bitoffs": "26",
-          "bitsize": "1",
-          "value_out": {"if":[{"var":"value"},1,0]}
         },
         {
           "data": "fixed parameter",
@@ -152,13 +130,6 @@
           "bitoffs": "16",
           "bitsize": "8",
           "value": 0
-        },
-        {
-          "data": "Learning mode",
-          "shortcut": "LM",
-          "bitoffs": "26",
-          "bitsize": "1",
-          "value_out": {"if":[{"var":"value"},1,0]}
         },
         {
           "data": "fixed parameter",
@@ -301,25 +272,6 @@
           "bitsize": "8",
           "value": 40
         }
-      ]
-    },
-    {
-      "send": false,
-       "datafield": [
-         {
-           "data": "Learning mode",
-           "shortcut": "LM",
-           "bitoffs": "26",
-           "bitsize": "1",
-           "value": {"==": [{"var": "value"},1]}
-         },
-         {
-           "data": "State blocked",
-           "shortcut": "SB",
-           "bitoffs": "29",
-           "bitsize": "1",
-           "value": {"==": [{"var": "value"},1]}
-         }
       ]
     }
   ]
